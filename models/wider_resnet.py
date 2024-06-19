@@ -618,6 +618,7 @@ model_efficient_x3d_xs.load_state_dict(checkpoint)
 s1=model_efficient_x3d_xs.s1
 s2=model_efficient_x3d_xs.s2
 s3=model_efficient_x3d_xs.s3
+s4=model_efficient_x3d_xs.s4
 
 class Efficientnet_X3D(nn.Module):
     """
@@ -640,3 +641,28 @@ class Efficientnet_X3D(nn.Module):
 
 
         return x1 , x2 , x3    
+
+
+class Efficientnet_X3D_v1(nn.Module):
+    """
+    This is wider resnet 38, output_stride=8
+    """
+    def __init__(self, pretrained=True):
+        super(Efficientnet_X3D_v1, self).__init__()
+        
+
+        self.mod1=s1
+        self.mod2=s2
+        self.mod3=s3
+        self.mod4=s4
+
+ 
+
+    def forward(self, x):
+        x1=self.mod1(x)
+        x2=self.mod2(x1)
+        x3=self.mod3(x2)
+        x4=self.mod4(x3)
+
+
+        return x1 , x2 , x4   

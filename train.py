@@ -11,7 +11,7 @@ from config.defaults import _C as config, update_config
 from utils import train_util, log_util, loss_util, optimizer_util, anomaly_util
 import models as models
 from models.wresnet1024_cattn_tsm import ASTNet as get_net1
-from models.wresnet2048_multiscale_cattn_tsmplus_layer6 import ASTNet as get_net2
+from models.wresnet2048_multiscale_cattn_tsmplus_layer6_v1 import ASTNet as get_net2
 import datasets
 
 
@@ -58,7 +58,7 @@ def main():
     if config.DATASET.DATASET == "ped2":
         model = get_net1(config)
     else:
-        model = get_net1(config)
+        model = get_net2(config)
 
     logger.info('Model: {}'.format(model.get_name()))
 

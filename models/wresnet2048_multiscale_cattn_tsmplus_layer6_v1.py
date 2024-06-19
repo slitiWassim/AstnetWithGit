@@ -1,8 +1,12 @@
 import logging
 import torch
 import torch.nn as nn
-from models.wider_resnet import wresnet ,Efficientnet_1024,Efficientnet_X3D
-from models.basic_modules import ConvBnRelu, ConvTransposeBnRelu, initialize_weights
+from models.wider_resnet import wresnet,Efficientnet_X3D_v1
+from models.basic_modules import ConvBnRelu, ConvTransposeBnRelu, initialize_weights 
+from torch.nn import functional as F
+from torchvision import models
+import torchvision
+import math
 
 logger = logging.getLogger(__name__)
 
@@ -16,106 +20,88 @@ class ASTNet(nn.Module):
         frames = config.MODEL.ENCODED_FRAMES
         final_conv_kernel = config.MODEL.EXTRA.FINAL_CONV_KERNEL
         self.model_name = config.MODEL.NAME
-        self.batch=config.TRAIN.BATCH_SIZE_PER_GPU
-        logger.info('=> ' + self.model_name + '_1024: (CATTN + TSM) - Ped2')
-        self.Efficientnet_X3D=Efficientnet_X3D()
-       # for param in self.Efficientnet_X3D.parameters():
-       #   param.requires_grad = False
-        #channels = [1280,256,160,128,64,48,24]
+
+        logger.info(self.model_name + ' (AM + TSM) - WiderResNet_layer6')
+
+        self.Efficientnet_X3D=Efficientnet_X3D_v1()
+
         channels = [192,96,48,24]
-        
-        self.conv_x8 = conv_block(ch_in=channels[2] * frames, ch_out=channels[3])
-        self.conv_x2 = conv_block(ch_in=channels[3] * frames, ch_out=channels[3])
-        self.conv_x0 = conv_block(ch_in=channels[3] * frames, ch_out=channels[3])
 
+        self.conv_x7 = conv_block(ch_in = channels[1] * frames, ch_out = channels[2])
+        self.conv_x3 = conv_block(ch_in = channels[3] * frames, ch_out = channels[3])
+        self.conv_x2 = conv_block(ch_in = channels[3] * frames, ch_out = channels[3])
 
-        self.up8 = ConvTransposeBnRelu(channels[3], channels[3],kernel_size=2)   # 2048          -> 1024
-        self.up4 = ConvTransposeBnRelu(channels[3] + channels[3], channels[3], kernel_size=2)   # 1024  +   256 -> 512
-        self.up2 = ConvTransposeBnRelu(channels[3] + channels[3], channels[3], kernel_size=2)   # 512   +   128 -> 256
+        self.tsm_left = TemporalShift(n_segment=4, n_div=16, direction='left', split=False)
 
-        self.tsm_left = TemporalShift(n_segment=4, n_div=16, direction='left')
- 
-        self.attn8 = ChannelAttention(channels[3])
-        self.attn4 = ChannelAttention(channels[3])
-        self.attn2 = ChannelAttention(channels[3])
+        self.up8 = ConvTransposeBnRelu(channels[2], channels[1], kernel_size=4,stride = 4)
+        self.up4 = ConvTransposeBnRelu(channels[3] + channels[3], channels[2], kernel_size=2)
+        self.up2 = ConvTransposeBnRelu(channels[3] + channels[3], channels[3], kernel_size=2)
+
+        lReLU = nn.LeakyReLU(0.2, True)
+        self.attn8 = RCAB(channels[1], channels[3], kernel_size=3, reduction=16, norm='BN', act=lReLU, downscale=True)
+        self.attn4 = RCAB(channels[2], channels[3], kernel_size=3, reduction=16, norm='BN', act=lReLU, downscale=True)
+        self.attn2 = RCAB(channels[3], channels[3], kernel_size=3, reduction=16, norm='BN', act=lReLU, downscale=True)
 
         self.final = nn.Sequential(
-            ConvBnRelu(channels[3], channels[3], kernel_size=1, padding=0),
-            ConvBnRelu(channels[3], channels[3], kernel_size=3, padding=1),
+            ConvBnRelu(channels[3], channels[3], kernel_size=3, padding=1),  # TODO: kernel_size=3
+            ConvBnRelu(channels[3], channels[3], kernel_size=5, padding=2),  # TODO: kernel_size=3
             nn.Conv2d(channels[3], 3,
                       kernel_size=final_conv_kernel,
-                      padding=1 if final_conv_kernel == 3 else 0,
+                      padding=(final_conv_kernel-1)//2,
                       bias=False)
         )
 
-        initialize_weights(self.conv_x0, self.conv_x2, self.conv_x8)
+        initialize_weights(self.conv_x2, self.conv_x3, self.conv_x7)
         initialize_weights(self.up2, self.up4, self.up8)
         initialize_weights(self.attn2, self.attn4, self.attn8)
         initialize_weights(self.final)
 
     def forward(self, x):
         x_input=torch.stack(x,dim=2)
-        #x_optical=torch.stack(optical,dim=2)
         x0,x1,x2=self.Efficientnet_X3D(x_input)
-#        _,_,x2_o,x3_o=self.Efficientnet_X3D(x_optical)
-#        x2=GatedFusion(x2,x2_o)
-#        x3=GatedFusion(x3,x3_o)
+
 
         x0=x0.view(x0.shape[0], -1, x0.shape[-2], x0.shape[-1])
         x1=x1.view(x1.shape[0], -1, x1.shape[-2], x1.shape[-1])
         x2=x2.view(x2.shape[0], -1, x2.shape[-2], x2.shape[-1])
-
-
-        x8 = self.conv_x8(x2)
-        x2 = self.conv_x2(x1)
-        x0 = self.conv_x0(x0)
         
+        x8 = self.conv_x7(x2)
+        x2 = self.conv_x3(x1)
+        x0 = self.conv_x2(x0)
+
         left = self.tsm_left(x8)
+
         x8 = x8 + left
         x = self.up8(x8)
         x = self.attn8(x)
-        x = self.up4(torch.cat([x2, x], dim=1))
+        print(x.shape)
+        print(x2.shape)
+
+        x = self.up4(torch.cat([x2, x], dim=1))     # 1024 + 512    -> 512, 48, 80
         x = self.attn4(x)
 
-        x = self.up2(torch.cat([x0, x], dim=1))
+        x = self.up2(torch.cat([x0, x], dim=1))     # 512 + 256     -> 256, 96, 160
         x = self.attn2(x)
-
 
         return self.final(x)
 
 
-class ChannelAttention(nn.Module):
-    def __init__(self, input_channels, reduction=16):
-        super(ChannelAttention, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.layer = nn.Sequential(
-            nn.Conv2d(input_channels, input_channels//reduction, 1, bias=True),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(input_channels//reduction, input_channels, 1, bias=True),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        y = self.avg_pool(x)
-        y = self.layer(y)
-        return x * y
-
-
 class TemporalShift(nn.Module):
-    def __init__(self, n_segment=4, n_div=8, direction='left'):
+    def __init__(self, n_segment=4, n_div=8, direction='left', split=False):
         super(TemporalShift, self).__init__()
         self.n_segment = n_segment
         self.fold_div = n_div
         self.direction = direction
+        self.split = split
 
         print('=> Using fold div: {}'.format(self.fold_div))
 
     def forward(self, x):
-        x = self.shift(x, self.n_segment, fold_div=self.fold_div, direction=self.direction)
+        x = self.shift(x, self.n_segment, fold_div=self.fold_div, direction=self.direction, split=self.split)
         return x
 
     @staticmethod
-    def shift(x, n_segment=4, fold_div=8, direction='left'):
+    def shift(x, n_segment=4, fold_div=8, direction='left', split=False):
         bz, nt, h, w = x.size()
         c = nt // n_segment
         x = x.view(bz, n_segment, c, h, w)
@@ -134,7 +120,13 @@ class TemporalShift(nn.Module):
             out[:, 1:, fold: 2 * fold] = x[:, :-1, fold: 2 * fold]
             out[:, :, 2 * fold:] = x[:, :, 2 * fold:]
 
-        return out.view(bz, nt, h, w)
+        if split:
+            p1, _ = out.split([fold * 2, c - (fold * 2)], dim=2)
+            p1 = p1.reshape(bz, n_segment * fold * 2, h, w)
+            return p1
+        else:
+            return out.view(bz, nt, h, w)
+
 
 class RCAB(nn.Module):
     def __init__(self, in_feat, out_feat, kernel_size, reduction,
@@ -201,6 +193,11 @@ class CALayer(nn.Module):
         y = self.avg_pool(x)
         y = self.conv_du(y)
         return y
+
+
+
+
+
 
 from torch import nn
 from torch.nn import functional as F
@@ -431,5 +428,4 @@ class Attention_block(nn.Module):
         # channel 减为1，并Sigmoid,得到权重矩阵
         psi = self.psi(psi)               #得到权重矩阵  1x256x64x64 -> 1x1x64x64 ->sigmoid 结果到（0，1）
         # 返回加权的 x
-        return x * psi                    #与low-level feature相乘，将权重矩阵赋值进去
-
+        return x * psi  
